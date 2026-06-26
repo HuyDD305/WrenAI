@@ -1,0 +1,168 @@
+name: wrenai
+
+volumes:
+  v1-data:       # bootstrap / engine / qdrant / UI sqlite
+  wren-home:     # wren v2 CLI profiles and config
+  postgres-data:
+
+networks:
+  wren:
+    driver: bridge
+
+services:
+
+  # ── WrenAI v1 — Chat Web UI (http://localhost:3000) ──────────────────────
+
+  bootstrap:
+    image: ghcr.io/canner/wren-bootstrap:${WREN_BOOTSTRAP_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM:-linux/amd64}
+    environment:
+      DATA_PATH: /app/data
+    volumes:
+      - v1-data:/app/data
+    command: /bin/sh /app/init.sh
+    networks:
+      - wren
+
+  wren-engine:
+    image: ghcr.io/canner/wren-engine:${WREN_ENGINE_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM:-linux/amd64}
+    expose:
+      - "8080"
+      - "7432"
+    volumes:
+      - v1-data:/usr/src/app/etc
+      - ./data:/usr/src/app/data
+    networks:
+      - wren
+    depends_on:
+      - bootstrap
+
+  ibis-server:
+    image: ghcr.io/canner/wren-engine-ibis:${IBIS_SERVER_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM:-linux/amd64}
+    expose:
+      - "8000"
+    environment:
+      WREN_ENGINE_ENDPOINT: http://wren-engine:8080
+    volumes:
+      - ./data:/usr/src/app/data
+    networks:
+      - wren
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.0
+    restart: on-failure
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - v1-data:/qdrant/storage
+    networks:
+      - wren
+
+  wren-ai-service:
+    image: ghcr.io/canner/wren-ai-service:${WREN_AI_SERVICE_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM:-linux/amd64}
+    expose:
+      - "5555"
+    environment:
+      PYTHONUNBUFFERED: 1
+      CONFIG_PATH: /app/config.yaml
+      QDRANT_HOST: qdrant
+      SHOULD_FORCE_DEPLOY: "1"
+      WREN_AI_SERVICE_PORT: "5555"
+      WREN_UI_PORT: "3000"
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data:ro
+    networks:
+      - wren
+    depends_on:
+      - qdrant
+
+  wren-ui:
+    image: ghcr.io/canner/wren-ui:${WREN_UI_VERSION}
+    restart: on-failure
+    platform: ${PLATFORM:-linux/amd64}
+    environment:
+      DB_TYPE: sqlite
+      SQLITE_FILE: /app/data/db.sqlite3
+      WREN_ENGINE_ENDPOINT: http://wren-engine:8080
+      WREN_AI_ENDPOINT: http://wren-ai-service:5555
+      IBIS_SERVER_ENDPOINT: http://ibis-server:8000
+      GENERATION_MODEL: ${GENERATION_MODEL:-gpt-4o-mini}
+      WREN_ENGINE_PORT: "8080"
+      WREN_AI_SERVICE_VERSION: ${WREN_AI_SERVICE_VERSION}
+      WREN_UI_VERSION: ${WREN_UI_VERSION}
+      WREN_ENGINE_VERSION: ${WREN_ENGINE_VERSION}
+      USER_UUID: ${USER_UUID}
+      POSTHOG_API_KEY: ${POSTHOG_API_KEY:-}
+      POSTHOG_HOST: ${POSTHOG_HOST:-https://app.posthog.com}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      NEXT_PUBLIC_USER_UUID: ${USER_UUID}
+      NEXT_PUBLIC_POSTHOG_API_KEY: ${POSTHOG_API_KEY:-}
+      NEXT_PUBLIC_POSTHOG_HOST: ${POSTHOG_HOST:-https://app.posthog.com}
+      NEXT_PUBLIC_TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      EXPERIMENTAL_ENGINE_RUST_VERSION: ${EXPERIMENTAL_ENGINE_RUST_VERSION:-false}
+      WREN_PRODUCT_VERSION: ${WREN_PRODUCT_VERSION}
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    volumes:
+      - v1-data:/app/data
+    networks:
+      - wren
+    depends_on:
+      - wren-ai-service
+      - wren-engine
+
+  # ── PostgreSQL — connect this inside the WrenAI UI ───────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wren}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wren}
+      POSTGRES_DB: ${POSTGRES_DB:-wren}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wren} -d ${POSTGRES_DB:-wren}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - wren
+
+  # ── WrenAI v2 CLI — for agent / Claude Code use ──────────────────────────
+
+  wren:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wrenai-cli:latest
+    env_file:
+      - .env
+    environment:
+      WREN_HOME: /wren-home
+    volumes:
+      - wren-home:/wren-home
+      - ./:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: ["--help"]
+    networks:
+      - wren
+    depends_on:
+      postgres:
+        condition: service_healthy
